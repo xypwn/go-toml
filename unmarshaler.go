@@ -36,6 +36,9 @@ type Decoder struct {
 
 	// toggles unmarshaler interface
 	unmarshalerInterface bool
+
+	// creates error messages
+	errorMaker ErrorMaker
 }
 
 // NewDecoder creates a new Decoder that will read from r.
@@ -71,6 +74,29 @@ func (d *Decoder) DisallowUnknownFields() *Decoder {
 func (d *Decoder) EnableUnmarshalerInterface() *Decoder {
 	d.unmarshalerInterface = true
 	return d
+}
+
+// FieldPosition will be unmarshaled to contain information
+// about the location and size of its preceeding field.
+//
+// [Decoder.ErrorMaker] allows the user to generate error
+// messages with this info.
+type FieldPosition struct {
+	highlight []byte
+}
+
+type ErrorMaker func(pos FieldPosition, format string, args ...interface{}) error
+
+// ErrorMaker returns a func that allows creating custom
+// errors with highlights after a Decoder has successfully
+// decoded.
+func (d *Decoder) ErrorMaker() ErrorMaker {
+	return func(pos FieldPosition, format string, args ...interface{}) error {
+		if d.errorMaker == nil {
+			panic("ErrorMaker invoked without decoding successfully first")
+		}
+		return d.errorMaker(pos, format, args...)
+	}
 }
 
 // Decode the whole content of r into v.
@@ -127,6 +153,13 @@ func (d *Decoder) Decode(v interface{}) error {
 		unmarshalerInterface: d.unmarshalerInterface,
 	}
 	dec.p.Reset(b)
+
+	d.errorMaker = func(pos FieldPosition, format string, args ...interface{}) error {
+		return wrapDecodeError(
+			dec.p.Data(),
+			unstable.NewParserError(pos.highlight, format, args...).(*unstable.ParserError),
+		)
+	}
 
 	return dec.FromParser(v)
 }
@@ -512,7 +545,7 @@ func (d *decoder) handleKeyPart(key unstable.Iterator, v reflect.Value, nextFn h
 			v.SetMapIndex(mk, mv)
 		}
 	case reflect.Struct:
-		path, found := structFieldPath(v, string(key.Node().Data))
+		path, _, found := structFieldPath(v, string(key.Node().Data))
 		if !found {
 			d.skipUntilTable = true
 			return reflect.Value{}, nil
@@ -1152,7 +1185,7 @@ func (d *decoder) handleKeyValuePart(key unstable.Iterator, value *unstable.Node
 			v.SetMapIndex(mk, mv)
 		}
 	case reflect.Struct:
-		path, found := structFieldPath(v, string(key.Node().Data))
+		path, posPath, found := structFieldPath(v, string(key.Node().Data))
 		if !found {
 			d.skipUntilTable = true
 			break
@@ -1166,8 +1199,12 @@ func (d *decoder) handleKeyValuePart(key unstable.Iterator, value *unstable.Node
 		d.errorContext.Field = path
 
 		f := fieldByIndex(v, path)
+		var pf reflect.Value
+		if posPath != nil {
+			pf = fieldByIndex(v, posPath)
+		}
 
-		if !f.CanAddr() {
+		if !f.CanAddr() || (posPath != nil && !pf.CanSet()) {
 			// If the field is not addressable, need to take a slower path and
 			// make a copy of the struct itself to a new location.
 			nvp := reflect.New(v.Type())
@@ -1182,6 +1219,10 @@ func (d *decoder) handleKeyValuePart(key unstable.Iterator, value *unstable.Node
 		x, err := d.handleKeyValueInner(key, value, f)
 		if err != nil {
 			return reflect.Value{}, err
+		}
+
+		if posPath != nil {
+			pf.Set(reflect.ValueOf(FieldPosition{value.Data}))
 		}
 
 		if x.IsValid() {
@@ -1257,41 +1298,47 @@ func fieldByIndex(v reflect.Value, path []int) reflect.Value {
 	return v
 }
 
-type fieldPathsMap = map[string][]int
+type fieldPathInfo struct {
+	fieldPath []int
+	posPath   []int // nil unless position info is requested
+}
+
+type fieldPathsMap = map[string]fieldPathInfo
 
 var globalFieldPathsCache atomic.Value // map[danger.TypeID]fieldPathsMap
 
-func structFieldPath(v reflect.Value, name string) ([]int, bool) {
+func structFieldPath(v reflect.Value, name string) (_path []int, _posPath []int, _ok bool) {
 	t := v.Type()
 
 	cache, _ := globalFieldPathsCache.Load().(map[danger.TypeID]fieldPathsMap)
-	fieldPaths, ok := cache[danger.MakeTypeID(t)]
+	fieldInfos, ok := cache[danger.MakeTypeID(t)]
 
 	if !ok {
-		fieldPaths = map[string][]int{}
+		fieldInfos = map[string]fieldPathInfo{}
 
-		forEachField(t, nil, func(name string, path []int) {
-			fieldPaths[name] = path
+		forEachField(t, nil, func(name string, path []int, posPath []int) {
+			info := fieldPathInfo{path, posPath}
+			fieldInfos[name] = info
 			// extra copy for the case-insensitive match
-			fieldPaths[strings.ToLower(name)] = path
+			fieldInfos[strings.ToLower(name)] = info
 		})
 
 		newCache := make(map[danger.TypeID]fieldPathsMap, len(cache)+1)
-		newCache[danger.MakeTypeID(t)] = fieldPaths
+		newCache[danger.MakeTypeID(t)] = fieldInfos
 		for k, v := range cache {
 			newCache[k] = v
 		}
 		globalFieldPathsCache.Store(newCache)
 	}
 
-	path, ok := fieldPaths[name]
+	info, ok := fieldInfos[name]
 	if !ok {
-		path, ok = fieldPaths[strings.ToLower(name)]
+		info, ok = fieldInfos[strings.ToLower(name)]
 	}
-	return path, ok
+	return info.fieldPath, info.posPath, ok
 }
 
-func forEachField(t reflect.Type, path []int, do func(name string, path []int)) {
+func forEachField(t reflect.Type, path []int, do func(name string, path []int, posPath []int)) {
 	n := t.NumField()
 	for i := 0; i < n; i++ {
 		f := t.Field(i)
@@ -1300,9 +1347,22 @@ func forEachField(t reflect.Type, path []int, do func(name string, path []int)) 
 			// only consider exported fields.
 			continue
 		}
+		if f.Type == fieldPositionType {
+			continue
+		}
 
 		fieldPath := append(path, i)
 		fieldPath = fieldPath[:len(fieldPath):len(fieldPath)]
+
+		var posPath []int
+		if i+1 < n {
+			next := t.Field(i + 1)
+			if next.Type == fieldPositionType {
+				posPath = make([]int, len(path), len(path)+1)
+				copy(posPath, path)
+				posPath = append(posPath, i+1)
+			}
+		}
 
 		name := f.Tag.Get("toml")
 		if name == "-" {
@@ -1329,6 +1389,6 @@ func forEachField(t reflect.Type, path []int, do func(name string, path []int)) 
 			name = f.Name
 		}
 
-		do(name, fieldPath)
+		do(name, fieldPath, posPath)
 	}
 }

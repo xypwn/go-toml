@@ -12,3 +12,4 @@ var textUnmarshalerType = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem(
 var mapStringInterfaceType = reflect.TypeOf(map[string]interface{}(nil))
 var sliceInterfaceType = reflect.TypeOf([]interface{}(nil))
 var stringType = reflect.TypeOf("")
+var fieldPositionType = reflect.TypeOf(FieldPosition{})

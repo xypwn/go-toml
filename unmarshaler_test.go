@@ -3851,6 +3851,22 @@ func TestUnmarshal_RecursiveTableArray(t *testing.T) {
 	}
 }
 
+func TestUnmarshalFieldPosition(t *testing.T) {
+	type doc struct {
+		A    string
+		APos toml.FieldPosition
+	}
+	d := doc{}
+
+	dec := toml.NewDecoder(strings.NewReader("A = 'foo'"))
+	makeErr := dec.ErrorMaker()
+	err := dec.Decode(&d)
+	assert.NoError(t, err)
+	errStr := makeErr(d.APos, "hello %v", "world").(*toml.DecodeError).String()
+	assert.Equal(t, `1| A = 'foo'
+ |      ~~~ hello world`, errStr)
+}
+
 func TestUnmarshalEmbedNonString(t *testing.T) {
 	type Foo []byte
 	type doc struct {

@@ -456,6 +456,11 @@ func isEmptyStruct(v reflect.Value) bool {
 			continue
 		}
 
+		// meta-data; skip
+		if typ == fieldPositionType {
+			continue
+		}
+
 		f := v.Field(i)
 
 		if !isEmptyValue(f) {
@@ -730,6 +735,11 @@ func walkStruct(ctx encoderCtx, t *table, v reflect.Value) {
 
 		// special field name to skip field
 		if tag == "-" {
+			continue
+		}
+
+		// meta-data; skip
+		if typ == fieldPositionType {
 			continue
 		}
 
