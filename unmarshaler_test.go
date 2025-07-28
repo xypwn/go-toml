@@ -3867,6 +3867,26 @@ func TestUnmarshalFieldPosition(t *testing.T) {
  |      ~~~ hello world`, errStr)
 }
 
+func ExampleFieldPosition() {
+	var v struct {
+		Foo    string
+		FooPos toml.FieldPosition
+	}
+	dec := toml.NewDecoder(strings.NewReader("Foo = 'baz'"))
+	makeErr := dec.ErrorMaker()
+	err := dec.Decode(&v)
+	if err != nil {
+		panic(err)
+	}
+
+	if v.Foo != "bar" {
+		fmt.Println(makeErr(v.FooPos, "Foo must equal 'bar'").(*toml.DecodeError).String())
+	}
+	// Output:
+	// 1| Foo = 'baz'
+	//  |        ~~~ Foo must equal 'bar'
+}
+
 func TestUnmarshalEmbedNonString(t *testing.T) {
 	type Foo []byte
 	type doc struct {
